@@ -2,11 +2,7 @@
 
 ![Java 8+](https://img.shields.io/badge/Java-8%2B-blue)
 
-`upki-java` adds offline server-certificate revocation checking to Java TLS clients. It uses the local revocation cache maintained by [UPKI](https://github.com/rustls/upki), without making CRL or OCSP requests of its own. Your existing certificate and hostname verification still apply.
-
-Enable it with a startup agent, install the security provider from code, or register it in the runtime's security configuration. Ordinary default-PKIX JSSE clients can use it without changing their TLS configuration.
-
-The library uses only the JDK. A single JAR supports Java 8 and later, with an explicit module descriptor for Java 9+. Run the UPKI updater separately to download and refresh revocation data; this library reads the cache, it does not maintain it.
+`upki-java` adds offline server-certificate revocation checking to Java TLS clients. It uses the local revocation cache maintained by [UPKI](https://github.com/rustls/upki), without making CRL or OCSP requests of its own. Once installed, PKIX JSSE clients use it without changing their TLS configuration.
 
 > [!IMPORTANT]
 > This library is in preview and has no published release yet. API names, configuration properties, and defaults may change. Please report bugs and feature requests in this repository's [issue tracker](https://github.com/Netflix/upki-java/issues).
