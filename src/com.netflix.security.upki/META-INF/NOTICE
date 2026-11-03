@@ -1,0 +1,7 @@
+upki-java
+Copyright 2026 Netflix, Inc.
+
+This product includes membership-query logic and test vectors adapted from cpu/go-upki.
+Copyright 2026 The Go Authors.
+Redistributed under BSD-3-Clause.
+The license text is included in the JAR as legal/go-upki-LICENSE.

@@ -1,0 +1,82 @@
+# Copyright 2026 Netflix, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+# in compliance with the License. You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License
+# is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+# or implied. See the License for the specific language governing permissions and limitations under
+# the License.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (Java ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ['8', '11', '17', '21', '25']
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up compatibility JDK
+        id: runtime
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: ${{ matrix.java }}
+
+      - name: Set up development JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version-file: .java-version
+
+      - name: Set up ja
+        uses: Netflix/ja/.github/actions/setup-ja@v0.26.16
+
+      - name: Test
+        env:
+          UPKI_TEST_JAVA_HOME: ${{ steps.runtime.outputs.path }}
+        run: ja test --all
+
+      - name: Assemble production artifacts
+        run: >-
+          ja -p com.netflix.security.upki assemble
+          --module-version "0.0.0-build.${{ github.run_id }}"
+          build/artifacts
+
+      - name: Validate assembled artifact
+        env:
+          TEST_JAVA_HOME: ${{ steps.runtime.outputs.path }}
+        run: |
+          artifact=build/artifacts/com.netflix.security.upki.jar
+          jar --validate --file "$artifact"
+          jar --describe-module --file "$artifact" --release 9
+          internals=$(jdeps --multi-release 9 --jdk-internals "$artifact")
+          if [[ -n "$internals" ]]; then
+            printf '%s\n' "$internals"
+            exit 1
+          fi
+          "$TEST_JAVA_HOME/bin/java" "-javaagent:$artifact" -version
+
+      - name: Upload production artifacts
+        if: matrix.java == '25'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upki-java
+          path: build/artifacts/
+          if-no-files-found: error

@@ -1,0 +1,711 @@
+/*
+ * Copyright 2026 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License. You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied. See the License for the specific language governing permissions and limitations under
+ * the License.
+ */
+
+package com.netflix.security.upki.test.fixture;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.net.InetAddress;
+import java.net.Socket;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.security.GeneralSecurityException;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.KeyStore;
+import java.security.NoSuchAlgorithmException;
+import java.security.Provider;
+import java.security.Security;
+import java.security.cert.CertPath;
+import java.security.cert.CertPathBuilder;
+import java.security.cert.CertPathBuilderException;
+import java.security.cert.CertPathBuilderResult;
+import java.security.cert.CertPathBuilderSpi;
+import java.security.cert.CertPathChecker;
+import java.security.cert.CertPathParameters;
+import java.security.cert.CertPathValidator;
+import java.security.cert.CertPathValidatorException;
+import java.security.cert.CertPathValidatorResult;
+import java.security.cert.CertPathValidatorSpi;
+import java.security.cert.CertStore;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.CollectionCertStoreParameters;
+import java.security.cert.PKIXBuilderParameters;
+import java.security.cert.PKIXCertPathBuilderResult;
+import java.security.cert.PKIXCertPathChecker;
+import java.security.cert.PKIXCertPathValidatorResult;
+import java.security.cert.PKIXParameters;
+import java.security.cert.PKIXRevocationChecker;
+import java.security.cert.TrustAnchor;
+import java.security.cert.X509CertSelector;
+import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import javax.net.ssl.CertPathTrustManagerParameters;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509ExtendedTrustManager;
+import javax.net.ssl.X509TrustManager;
+
+/** Experimental observation, not a production provider or a general opaque-verifier solution. */
+public final class PathCaptureProbe {
+    private static final ThreadLocal<Scope> CURRENT = new ThreadLocal<Scope>();
+    private static final AtomicInteger SUCCESSFUL_PATH_CALLS = new AtomicInteger();
+    private static final AtomicInteger COMMITTED_CHECKS = new AtomicInteger();
+    private static final Map<String, X509Certificate> CERTIFICATES = new HashMap<String, X509Certificate>();
+    private static final CertPathBuilderException NESTED_REJECTION = new CertPathBuilderException("outer builder policy rejected");
+    private static Provider validatorProvider;
+    private static Provider builderProvider;
+    private static KeyStore roots;
+    private static boolean identityChecks;
+    private static CertPath lastValidatorPath;
+    private static CertPathParameters lastValidatorParameters;
+    private static CertPathValidatorResult lastValidatorResult;
+    private static CertPathParameters lastBuilderParameters;
+    private static CertPathBuilderResult lastBuilderResult;
+
+    public static void main(String[] args) throws Exception {
+        Path directory = Paths.get(args[0]);
+        String scenario = args[1];
+        identityChecks = scenario.equals("delegation-api");
+        System.setProperty("javax.net.ssl.trustStore", directory.resolve("roots.jks").toString());
+        System.setProperty("javax.net.ssl.trustStoreType", "JKS");
+        System.setProperty("javax.net.ssl.trustStorePassword", "changeit");
+        roots = store(directory.resolve("roots.jks"));
+        for (String name : Arrays.asList("issuer-a", "issuer-b", "decoy", "unrelated", "leaf-a", "leaf-b", "variant", "intermediate", "leaf-intermediate")) {
+            try (InputStream input = Files.newInputStream(directory.resolve(name + ".der"))) {
+                CERTIFICATES.put(name, (X509Certificate) CertificateFactory.getInstance("X.509").generateCertificate(input));
+            }
+        }
+        // Pin only the originally selected PKIX providers in this controlled experiment.
+        validatorProvider = CertPathValidator.getInstance("PKIX").getProvider();
+        builderProvider = CertPathBuilder.getInstance("PKIX").getProvider();
+        final CertPathValidator cachedValidator = CertPathValidator.getInstance("PKIX");
+        require(Security.insertProviderAt(new CaptureProvider(), 1) == 1, "observer installation");
+        final X509TrustManager delegate = manager("PKIX", false, null);
+        final X509Certificate leaf = cert("leaf-a");
+        X509Certificate[] ordered = {leaf, cert("issuer-a")};
+
+        switch (scenario) {
+            case "ordered":
+                issuer(observe(leaf, () -> delegate.checkServerTrusted(ordered, "RSA")), "issuer-a");
+                break;
+            case "unordered": {
+                X509Certificate[] peer = {leaf, cert("decoy"), cert("unrelated"), cert("issuer-a")};
+                List<Observation> paths = observe(leaf, () -> delegate.checkServerTrusted(peer, "RSA"));
+                issuer(paths, "issuer-a");
+                require(paths.stream().anyMatch(p -> p.builder), "builder result was not observed");
+                break;
+            }
+            case "intermediate": {
+                X509Certificate target = cert("leaf-intermediate");
+                X509Certificate[] peer = {target, cert("intermediate"), cert("issuer-a")};
+                List<Observation> paths = observe(target, () -> delegate.checkServerTrusted(peer, "RSA"));
+                issuer(paths, "intermediate");
+                require(paths.get(0).path.getCertificates().size() == 2, "intermediate missing from authenticated path");
+                break;
+            }
+            case "hidden-intermediate": {
+                final X509Certificate target = cert("leaf-intermediate");
+                final X509TrustManager configured = manager("PKIX", false, parameters(target));
+                X509TrustManager hidden = new ServerOnlyManager() {
+                    public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                        configured.checkServerTrusted(chain, authType);
+                    }
+                    public X509Certificate[] getAcceptedIssuers() {
+                        throw new AssertionError("hidden intermediate must come from the actual build result");
+                    }
+                };
+                issuer(observe(target, () -> hidden.checkServerTrusted(new X509Certificate[] {target}, "RSA")), "intermediate");
+                break;
+            }
+            case "omitted":
+                issuer(observe(leaf, () -> delegate.checkServerTrusted(new X509Certificate[] {leaf}, "RSA")), "issuer-a");
+                break;
+            case "opaque": {
+                final AtomicInteger before = new AtomicInteger();
+                final AtomicInteger after = new AtomicInteger();
+                X509TrustManager hidden = new ServerOnlyManager() {
+                    public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                        before.incrementAndGet();
+                        delegate.checkServerTrusted(chain, authType);
+                        after.incrementAndGet();
+                    }
+                    public X509Certificate[] getAcceptedIssuers() {
+                        throw new AssertionError("issuer acquisition must not reconstruct hidden trust inputs");
+                    }
+                };
+                issuer(observe(leaf, () -> hidden.checkServerTrusted(ordered, "RSA")), "issuer-a");
+                require(before.get() == 1 && after.get() == 1, "wrapper behavior was bypassed");
+                break;
+            }
+            case "default-store": {
+                X509TrustManager defaults = manager("PKIX", true, null);
+                issuer(observe(leaf, () -> defaults.checkServerTrusted(ordered, "RSA")), "issuer-a");
+                break;
+            }
+            case "parameters": {
+                CountingChecker checker = new CountingChecker(false);
+                PKIXBuilderParameters parameters = parameters();
+                parameters.addCertPathChecker(checker);
+                X509TrustManager configured = manager("PKIX", false, parameters);
+                issuer(observe(leaf, () -> configured.checkServerTrusted(ordered, "RSA")), "issuer-a");
+                require(checker.visits.get() > 0, "custom PKIX checker was not preserved");
+                break;
+            }
+            case "post-validation-reject": {
+                final CertificateException rejection = new CertificateException("wrapper rejection after PKIX success");
+                X509TrustManager rejecting = new ServerOnlyManager() {
+                    public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                        delegate.checkServerTrusted(chain, authType);
+                        throw rejection;
+                    }
+                };
+                try {
+                    observe(leaf, () -> rejecting.checkServerTrusted(ordered, "RSA"));
+                    throw new AssertionError("wrapper rejection lost");
+                } catch (CertificateException expected) {
+                    require(expected == rejection, "wrapper exception was changed");
+                }
+                require(SUCCESSFUL_PATH_CALLS.get() > 0 && COMMITTED_CHECKS.get() == 0, "failed outer check committed a path");
+                break;
+            }
+            case "checker-reject": {
+                CountingChecker checker = new CountingChecker(true);
+                PKIXBuilderParameters parameters = parameters();
+                parameters.addCertPathChecker(checker);
+                X509TrustManager configured = manager("PKIX", false, parameters);
+                try {
+                    observe(leaf, () -> configured.checkServerTrusted(ordered, "RSA"));
+                    throw new AssertionError("PKIX checker rejection lost");
+                } catch (CertificateException expected) {
+                    require(checker.visits.get() > 0, "custom checker did not reject");
+                }
+                require(SUCCESSFUL_PATH_CALLS.get() == 0 && COMMITTED_CHECKS.get() == 0, "rejected path was observed as successful");
+                break;
+            }
+            case "concurrent": {
+                ExecutorService pool = Executors.newFixedThreadPool(8);
+                try {
+                    List<Callable<Void>> checks = new ArrayList<Callable<Void>>();
+                    for (int i = 0; i < 100; i++) {
+                        final String suffix = i % 2 == 0 ? "a" : "b";
+                        checks.add(() -> {
+                            X509Certificate target = cert("leaf-" + suffix);
+                            issuer(observe(target, () -> delegate.checkServerTrusted(new X509Certificate[] {target}, "RSA")), "issuer-" + suffix);
+                            require(CURRENT.get() == null, "worker scope leaked");
+                            return null;
+                        });
+                    }
+                    for (Future<Void> check : pool.invokeAll(checks)) check.get();
+                } finally {
+                    pool.shutdownNow();
+                }
+                break;
+            }
+            case "different-leaf": {
+                List<Observation> paths = observe(leaf, () -> {
+                    delegate.checkServerTrusted(new X509Certificate[] {cert("leaf-b")}, "RSA");
+                    delegate.checkServerTrusted(ordered, "RSA");
+                });
+                issuer(paths, "issuer-a");
+                require(paths.size() == 1, "another leaf's path leaked into this check");
+                break;
+            }
+            case "off-thread": {
+                ExecutorService worker = Executors.newSingleThreadExecutor();
+                try (Scope scope = new Scope(leaf)) {
+                    worker.submit(() -> {
+                        delegate.checkServerTrusted(ordered, "RSA");
+                        return null;
+                    }).get(15, TimeUnit.SECONDS);
+                    require(scope.commit().isEmpty(), "thread-local scope unexpectedly crossed into worker validation");
+                    require(SUCCESSFUL_PATH_CALLS.get() > 0, "worker did not complete PKIX validation");
+                } finally {
+                    worker.shutdownNow();
+                }
+                break;
+            }
+            case "nested": {
+                try (Scope outer = new Scope(leaf)) {
+                    X509Certificate other = cert("leaf-b");
+                    issuer(observe(other, () -> delegate.checkServerTrusted(new X509Certificate[] {other}, "RSA")), "issuer-b");
+                    require(CURRENT.get() == outer, "outer scope was not restored");
+                    delegate.checkServerTrusted(ordered, "RSA");
+                    issuer(outer.commit(), "issuer-a");
+                }
+                break;
+            }
+            case "sunx509": {
+                X509TrustManager simple = manager("SunX509", false, null);
+                require(observe(leaf, () -> simple.checkServerTrusted(ordered, "RSA")).isEmpty(), "unexpected SimpleValidator path");
+                break;
+            }
+            case "pinned": {
+                final CertPathValidator pinned = CertPathValidator.getInstance("PKIX", validatorProvider);
+                final PKIXParameters parameters = parameters();
+                X509TrustManager hidden = new ServerOnlyManager() {
+                    public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                        validate(pinned, chain[0], parameters);
+                    }
+                };
+                require(observe(leaf, () -> hidden.checkServerTrusted(ordered, "RSA")).isEmpty(), "pinned validator should bypass observation");
+                break;
+            }
+            case "cached-validator": {
+                final PKIXParameters parameters = parameters();
+                require(observe(leaf, () -> validate(cachedValidator, leaf, parameters)).isEmpty(),
+                        "pre-install validator unexpectedly passed through the observer");
+                break;
+            }
+            case "opaque-indistinguishable": {
+                PKIXParameters original = parameters();
+                PKIXParameters alternate = new PKIXParameters(Collections.singleton(new TrustAnchor(cert("variant"), null)));
+                alternate.setRevocationEnabled(false);
+                X509TrustManager first = pinnedManager(original);
+                X509TrustManager second = pinnedManager(alternate);
+                require(first.getClass() == second.getClass(), "opaque verifiers have different observable classes");
+                require(first.getAcceptedIssuers().length == 0 && second.getAcceptedIssuers().length == 0,
+                        "opaque verifiers exposed their trust inputs");
+                X509Certificate[] peer = {leaf, cert("variant")};
+                require(observe(leaf, () -> first.checkServerTrusted(peer, "RSA")).isEmpty(), "first pinned path was observed");
+                require(observe(leaf, () -> second.checkServerTrusted(peer, "RSA")).isEmpty(), "second pinned path was observed");
+                byte[] firstHash = java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(Files.readAllBytes(directory.resolve("issuer-a.spki")));
+                byte[] secondHash = java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(Files.readAllBytes(directory.resolve("variant.spki")));
+                require(!Arrays.equals(firstHash, secondHash), "hidden authenticated SPKI hashes are identical");
+                break;
+            }
+            case "direct-trust": {
+                X509Certificate anchor = cert("issuer-a");
+                require(observe(anchor, () -> delegate.checkServerTrusted(new X509Certificate[] {anchor}, "RSA")).isEmpty(), "direct trust performed unexpected PKIX work");
+                break;
+            }
+            case "key-only-anchor": {
+                final PKIXParameters parameters = new PKIXParameters(Collections.singleton(new TrustAnchor(
+                        cert("issuer-a").getSubjectX500Principal(), cert("issuer-a").getPublicKey(), null)));
+                parameters.setRevocationEnabled(false);
+                final CertPathValidator selected = CertPathValidator.getInstance("PKIX");
+                List<Observation> paths = observe(leaf, () -> validate(selected, leaf, parameters));
+                require(paths.size() == 1 && paths.get(0).issuer() == null, "invented a certificate for a key-only anchor");
+                break;
+            }
+            case "tls":
+                tls(directory, (X509ExtendedTrustManager) delegate, false, "server.jks", "issuer-a");
+                break;
+            case "tls-hostname-reject":
+                tls(directory, (X509ExtendedTrustManager) delegate, true, "server.jks", "issuer-a");
+                break;
+            case "tls-intermediate":
+                tls(directory, (X509ExtendedTrustManager) delegate, false, "intermediate-server.jks", "intermediate");
+                break;
+            case "spki-ambiguity": {
+                final X509Certificate variant = cert("variant");
+                leaf.verify(variant.getPublicKey());
+                require(leaf.getIssuerX500Principal().equals(variant.getSubjectX500Principal()), "issuer name mismatch");
+                try {
+                    variant.verify(cert("issuer-a").getPublicKey());
+                    throw new AssertionError("forged issuer unexpectedly verified");
+                } catch (GeneralSecurityException expected) {
+                    // Matching the leaf's signing key does not authenticate this issuer certificate.
+                }
+                byte[] originalHash = java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(Files.readAllBytes(directory.resolve("issuer-a.spki")));
+                byte[] variantHash = java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(Files.readAllBytes(directory.resolve("variant.spki")));
+                require(!Arrays.equals(originalHash, variantHash), "SPKI encodings did not produce different lookup hashes");
+                X509TrustManager hidden = new ServerOnlyManager() {
+                    public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                        // This verifier obtains its issuer from its private store, ignoring extra peer certificates.
+                        delegate.checkServerTrusted(new X509Certificate[] {chain[0]}, authType);
+                    }
+                };
+                X509Certificate[] peer = {leaf, variant};
+                issuer(observe(leaf, () -> hidden.checkServerTrusted(peer, "RSA")), "issuer-a");
+                break;
+            }
+            case "multiple-paths": {
+                final CertPathValidator selected = CertPathValidator.getInstance("PKIX");
+                final PKIXParameters original = parameters();
+                final PKIXParameters alternate = new PKIXParameters(Collections.singleton(new TrustAnchor(cert("variant"), null)));
+                alternate.setRevocationEnabled(false);
+                List<Observation> paths = observe(leaf, () -> {
+                    validate(selected, leaf, original);
+                    validate(selected, leaf, alternate);
+                });
+                require(paths.size() == 2, "multiple successful paths were silently collapsed");
+                require(cert("issuer-a").equals(paths.get(0).issuer()) && cert("variant").equals(paths.get(1).issuer()),
+                        "lost one of the authenticated issuer encodings");
+                break;
+            }
+            case "nested-builder-reject": {
+                builderProvider = new RejectingBuilderProvider();
+                final CertPathBuilder selected = CertPathBuilder.getInstance("PKIX");
+                final PKIXBuilderParameters parameters = parameters();
+                List<Observation> paths = observe(leaf, () -> {
+                    try {
+                        selected.build(parameters);
+                        throw new AssertionError("outer builder accepted");
+                    } catch (CertPathBuilderException expected) {
+                        require(expected == NESTED_REJECTION, "nested rejection was changed");
+                    } catch (InvalidAlgorithmParameterException invalid) {
+                        throw new CertificateException(invalid);
+                    }
+                    delegate.checkServerTrusted(ordered, "RSA");
+                });
+                issuer(paths, "issuer-a");
+                break;
+            }
+            case "delegation-api": {
+                CertPath path = path(leaf);
+                PKIXBuilderParameters parameters = parameters();
+                CertPathValidator validator = CertPathValidator.getInstance("PKIX");
+                CertPathValidatorResult result = validator.validate(path, parameters);
+                require(lastValidatorPath == path && lastValidatorParameters == parameters && lastValidatorResult == result,
+                        "validator did not preserve input/result identity");
+                CertPathBuilder builder = CertPathBuilder.getInstance("PKIX");
+                CertPathBuilderResult built = builder.build(parameters);
+                require(lastBuilderParameters == parameters && lastBuilderResult == built, "builder did not preserve input/result identity");
+                require(validator.getRevocationChecker() instanceof PKIXRevocationChecker
+                        && builder.getRevocationChecker() instanceof PKIXRevocationChecker, "revocation-checker API was not delegated");
+                break;
+            }
+            default:
+                throw new AssertionError(scenario);
+        }
+        require(CURRENT.get() == null, "scope leaked into the caller");
+        System.out.println("PASS " + scenario + " java=" + System.getProperty("java.version")
+                + " successfulPkix=" + SUCCESSFUL_PATH_CALLS.get() + " committedChecks=" + COMMITTED_CHECKS.get());
+    }
+
+    private static X509Certificate cert(String name) {
+        return CERTIFICATES.get(name);
+    }
+
+    private static KeyStore store(Path path) throws Exception {
+        KeyStore store = KeyStore.getInstance("JKS");
+        try (InputStream input = Files.newInputStream(path)) {
+            store.load(input, "changeit".toCharArray());
+        }
+        return store;
+    }
+
+    private static PKIXBuilderParameters parameters() throws Exception {
+        return parameters(cert("leaf-a"));
+    }
+
+    private static PKIXBuilderParameters parameters(X509Certificate leaf) throws Exception {
+        X509CertSelector target = new X509CertSelector();
+        target.setCertificate(leaf);
+        PKIXBuilderParameters parameters = new PKIXBuilderParameters(roots, target);
+        parameters.setRevocationEnabled(false);
+        parameters.addCertStore(CertStore.getInstance("Collection", new CollectionCertStoreParameters(CERTIFICATES.values())));
+        return parameters;
+    }
+
+    private static X509TrustManager manager(String algorithm, boolean defaults, PKIXBuilderParameters parameters) throws Exception {
+        TrustManagerFactory factory = TrustManagerFactory.getInstance(algorithm, "SunJSSE");
+        if (parameters != null) factory.init(new CertPathTrustManagerParameters(parameters));
+        else factory.init(defaults ? null : roots);
+        return (X509TrustManager) factory.getTrustManagers()[0];
+    }
+
+    private static X509TrustManager pinnedManager(final PKIXParameters parameters) throws NoSuchAlgorithmException {
+        final CertPathValidator validator = CertPathValidator.getInstance("PKIX", validatorProvider);
+        return new ServerOnlyManager() {
+            public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                validate(validator, chain[0], parameters);
+            }
+        };
+    }
+
+    private static CertPath path(X509Certificate leaf) throws CertificateException {
+        return CertificateFactory.getInstance("X.509").generateCertPath(Collections.singletonList(leaf));
+    }
+
+    private static void validate(CertPathValidator validator, X509Certificate leaf, PKIXParameters parameters) throws CertificateException {
+        try {
+            validator.validate(path(leaf), parameters);
+        } catch (GeneralSecurityException invalid) {
+            throw new CertificateException(invalid);
+        }
+    }
+
+    private static List<Observation> observe(X509Certificate leaf, Check check) throws CertificateException {
+        try (Scope scope = new Scope(leaf)) {
+            check.run();
+            return scope.commit();
+        }
+    }
+
+    private static void issuer(List<Observation> paths, String expected) {
+        require(paths != null && !paths.isEmpty(), "no path observed for " + expected);
+        for (Observation observation : paths) require(cert(expected).equals(observation.issuer()), "wrong issuer observed");
+    }
+
+    private static void record(CertPath path, PKIXCertPathValidatorResult result, boolean builder) {
+        SUCCESSFUL_PATH_CALLS.incrementAndGet();
+        Scope current = CURRENT.get();
+        // An inner validator can succeed before its enclosing builder rejects.
+        if (current != null && current.operationDepth == 1 && !path.getCertificates().isEmpty()
+                && current.leaf.equals(path.getCertificates().get(0))) {
+            current.paths.add(new Observation(path, result.getTrustAnchor(), builder));
+        }
+    }
+
+    private static void require(boolean condition, String message) {
+        if (!condition) throw new AssertionError(message);
+    }
+
+    private interface Check {
+        void run() throws CertificateException;
+    }
+
+    private static final class Observation {
+        final CertPath path;
+        final TrustAnchor anchor;
+        final boolean builder;
+        Observation(CertPath path, TrustAnchor anchor, boolean builder) {
+            this.path = path;
+            this.anchor = anchor;
+            this.builder = builder;
+        }
+        X509Certificate issuer() {
+            return path.getCertificates().size() > 1 ? (X509Certificate) path.getCertificates().get(1) : anchor.getTrustedCert();
+        }
+    }
+
+    private static final class Scope implements AutoCloseable {
+        final X509Certificate leaf;
+        final Scope previous;
+        final List<Observation> paths = new ArrayList<Observation>();
+        int operationDepth;
+        Scope(X509Certificate leaf) {
+            this.leaf = leaf;
+            previous = CURRENT.get();
+            CURRENT.set(this);
+        }
+        List<Observation> commit() {
+            COMMITTED_CHECKS.incrementAndGet();
+            return Collections.unmodifiableList(new ArrayList<Observation>(paths));
+        }
+        public void close() {
+            if (previous == null) CURRENT.remove();
+            else CURRENT.set(previous);
+        }
+    }
+
+    public static final class CaptureProvider extends Provider {
+        public CaptureProvider() {
+            super("UPKIPathProbe", 1.0, "Test-only successful PKIX path observation");
+            put("CertPathValidator.PKIX", Validator.class.getName());
+            put("CertPathBuilder.PKIX", Builder.class.getName());
+        }
+    }
+
+    public static final class Validator extends CertPathValidatorSpi {
+        private final CertPathValidator delegate;
+        public Validator() throws NoSuchAlgorithmException {
+            delegate = CertPathValidator.getInstance("PKIX", validatorProvider);
+        }
+        public CertPathValidatorResult engineValidate(CertPath path, CertPathParameters parameters)
+                throws CertPathValidatorException, InvalidAlgorithmParameterException {
+            Scope scope = CURRENT.get();
+            if (scope != null) scope.operationDepth++;
+            try {
+                CertPathValidatorResult result = delegate.validate(path, parameters);
+                if (identityChecks) {
+                    lastValidatorPath = path;
+                    lastValidatorParameters = parameters;
+                    lastValidatorResult = result;
+                }
+                if (result instanceof PKIXCertPathValidatorResult) record(path, (PKIXCertPathValidatorResult) result, false);
+                return result;
+            } finally {
+                if (scope != null) scope.operationDepth--;
+            }
+        }
+        public CertPathChecker engineGetRevocationChecker() {
+            return delegate.getRevocationChecker();
+        }
+    }
+
+    public static final class Builder extends CertPathBuilderSpi {
+        private final CertPathBuilder delegate;
+        public Builder() throws NoSuchAlgorithmException {
+            delegate = CertPathBuilder.getInstance("PKIX", builderProvider);
+        }
+        public CertPathBuilderResult engineBuild(CertPathParameters parameters)
+                throws CertPathBuilderException, InvalidAlgorithmParameterException {
+            Scope scope = CURRENT.get();
+            if (scope != null) scope.operationDepth++;
+            try {
+                CertPathBuilderResult result = delegate.build(parameters);
+                if (identityChecks) {
+                    lastBuilderParameters = parameters;
+                    lastBuilderResult = result;
+                }
+                if (result instanceof PKIXCertPathBuilderResult) {
+                    PKIXCertPathBuilderResult built = (PKIXCertPathBuilderResult) result;
+                    record(built.getCertPath(), built, true);
+                }
+                return result;
+            } finally {
+                if (scope != null) scope.operationDepth--;
+            }
+        }
+        public CertPathChecker engineGetRevocationChecker() {
+            return delegate.getRevocationChecker();
+        }
+    }
+
+    public static final class RejectingBuilderProvider extends Provider {
+        public RejectingBuilderProvider() {
+            super("RejectingBuilderProbe", 1.0, "Test-only nested PKIX policy rejection");
+            put("CertPathBuilder.PKIX", RejectingBuilder.class.getName());
+        }
+    }
+
+    public static final class RejectingBuilder extends CertPathBuilderSpi {
+        public CertPathBuilderResult engineBuild(CertPathParameters parameters)
+                throws CertPathBuilderException, InvalidAlgorithmParameterException {
+            PKIXParameters alternate = new PKIXParameters(Collections.singleton(new TrustAnchor(cert("variant"), null)));
+            alternate.setRevocationEnabled(false);
+            try {
+                CertPathValidator.getInstance("PKIX").validate(path(cert("leaf-a")), alternate);
+            } catch (NoSuchAlgorithmException | CertificateException | CertPathValidatorException failure) {
+                throw new CertPathBuilderException(failure);
+            }
+            throw NESTED_REJECTION;
+        }
+    }
+
+    private abstract static class ServerOnlyManager implements X509TrustManager {
+        public void checkClientTrusted(X509Certificate[] chain, String authType) {
+            throw new UnsupportedOperationException("client verification not used by this fixture");
+        }
+        public X509Certificate[] getAcceptedIssuers() {
+            return new X509Certificate[0];
+        }
+    }
+
+    private static final class CountingChecker extends PKIXCertPathChecker {
+        final AtomicInteger visits = new AtomicInteger();
+        final boolean reject;
+        CountingChecker(boolean reject) { this.reject = reject; }
+        public void init(boolean forward) {}
+        public boolean isForwardCheckingSupported() { return false; }
+        public Set<String> getSupportedExtensions() { return Collections.emptySet(); }
+        public void check(Certificate certificate, Collection<String> unresolved) throws CertPathValidatorException {
+            visits.incrementAndGet();
+            if (reject) throw new CertPathValidatorException("test policy rejection");
+        }
+    }
+
+    private static final class ObservingManager extends X509ExtendedTrustManager {
+        private final X509ExtendedTrustManager delegate;
+        volatile List<Observation> accepted;
+        ObservingManager(X509ExtendedTrustManager delegate) { this.delegate = delegate; }
+        private void server(X509Certificate[] chain, Check check) throws CertificateException {
+            accepted = observe(chain[0], check);
+        }
+        public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+            server(chain, () -> delegate.checkServerTrusted(chain, authType));
+        }
+        public void checkServerTrusted(X509Certificate[] chain, String authType, Socket socket) throws CertificateException {
+            server(chain, () -> delegate.checkServerTrusted(chain, authType, socket));
+        }
+        public void checkServerTrusted(X509Certificate[] chain, String authType, SSLEngine engine) throws CertificateException {
+            server(chain, () -> delegate.checkServerTrusted(chain, authType, engine));
+        }
+        public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+            delegate.checkClientTrusted(chain, authType);
+        }
+        public void checkClientTrusted(X509Certificate[] chain, String authType, Socket socket) throws CertificateException {
+            delegate.checkClientTrusted(chain, authType, socket);
+        }
+        public void checkClientTrusted(X509Certificate[] chain, String authType, SSLEngine engine) throws CertificateException {
+            delegate.checkClientTrusted(chain, authType, engine);
+        }
+        public X509Certificate[] getAcceptedIssuers() { return delegate.getAcceptedIssuers(); }
+    }
+
+    private static void tls(Path directory, X509ExtendedTrustManager delegate, boolean rejectName,
+            String identity, String expectedIssuer) throws Exception {
+        KeyManagerFactory keys = KeyManagerFactory.getInstance("SunX509", "SunJSSE");
+        keys.init(store(directory.resolve(identity)), "changeit".toCharArray());
+        SSLContext serverContext = SSLContext.getInstance("TLS", "SunJSSE");
+        serverContext.init(keys.getKeyManagers(), new TrustManager[0], null);
+        ObservingManager observing = new ObservingManager(delegate);
+        SSLContext clientContext = SSLContext.getInstance("TLS", "SunJSSE");
+        clientContext.init(null, new TrustManager[] {observing}, null);
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        try (SSLServerSocket listener = (SSLServerSocket) serverContext.getServerSocketFactory()
+                .createServerSocket(0, 1, InetAddress.getLoopbackAddress())) {
+            listener.setSoTimeout(10000);
+            Future<?> serving = worker.submit(() -> {
+                try (SSLSocket socket = (SSLSocket) listener.accept()) {
+                    socket.setSoTimeout(10000);
+                    socket.startHandshake();
+                } catch (IOException failure) {
+                    if (!rejectName) throw new UncheckedIOException(failure);
+                }
+            });
+            try (Socket connection = new Socket(InetAddress.getLoopbackAddress(), listener.getLocalPort());
+                    SSLSocket client = (SSLSocket) clientContext.getSocketFactory().createSocket(connection,
+                            rejectName ? "wrong.invalid" : "localhost", listener.getLocalPort(), true)) {
+                client.setSoTimeout(10000);
+                SSLParameters parameters = client.getSSLParameters();
+                parameters.setEndpointIdentificationAlgorithm("HTTPS");
+                client.setSSLParameters(parameters);
+                try {
+                    client.startHandshake();
+                    require(!rejectName, "hostname mismatch accepted");
+                    issuer(observing.accepted, expectedIssuer);
+                } catch (SSLHandshakeException failure) {
+                    if (!rejectName) throw failure;
+                    require(failure.getMessage().contains("wrong.invalid"), "unexpected handshake rejection: " + failure);
+                    require(SUCCESSFUL_PATH_CALLS.get() > 0 && observing.accepted == null && COMMITTED_CHECKS.get() == 0,
+                            "hostname failure committed a path");
+                }
+            }
+            serving.get(15, TimeUnit.SECONDS);
+        } finally {
+            worker.shutdownNow();
+        }
+    }
+}

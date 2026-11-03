@@ -1,0 +1,105 @@
+/*
+ * Copyright 2026 Netflix, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License. You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied. See the License for the specific language governing permissions and limitations under
+ * the License.
+ */
+
+package com.netflix.security.upki.test.fixture;
+
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.URL;
+import java.security.KeyStore;
+import java.security.Security;
+import java.util.concurrent.atomic.AtomicReference;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
+
+public final class Main {
+    public static void main(String[] args) throws Exception {
+        if (args[0].equals("providers")) {
+            System.out.println("overlays.enabled=" + Security.getProperty("security.overridePropertiesFile"));
+            for (int i = 1; Security.getProperty("security.provider." + i) != null; i++) {
+                System.out.println("security.provider." + i + "=" + Security.getProperty("security.provider." + i));
+            }
+            return;
+        }
+        if (args[0].equals("late")) {
+            SSLContext.getDefault();
+            HttpsURLConnection.getDefaultSSLSocketFactory();
+        }
+        if (args[0].equals("runtime") || args[0].equals("late")) {
+            Security.insertProviderAt(new ProbeProvider(), 1);
+            if (!Boolean.getBoolean("probe.override")) {
+                Security.setProperty("ssl.TrustManagerFactory.algorithm", "UPKI");
+            }
+        }
+        System.out.println("default algorithm=" + TrustManagerFactory.getDefaultAlgorithm());
+        System.out.println("default factory=" + TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).getProvider().getName());
+        System.out.println("PKIX factory=" + TrustManagerFactory.getInstance("PKIX").getProvider().getName());
+        System.out.println("pinned factory=" + TrustManagerFactory.getInstance("PKIX", "SunJSSE").getProvider().getName());
+
+        KeyStore store = KeyStore.getInstance("JKS");
+        try (InputStream in = new FileInputStream(System.getProperty("javax.net.ssl.trustStore"))) {
+            store.load(in, "changeit".toCharArray());
+        }
+        KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(store, "changeit".toCharArray());
+        SSLContext serverContext = SSLContext.getInstance("TLS");
+        serverContext.init(kmf.getKeyManagers(), null, null);
+        final SSLServerSocket server = (SSLServerSocket) serverContext.getServerSocketFactory().createServerSocket(0);
+        server.setSoTimeout(10000);
+        final AtomicReference<Throwable> failure = new AtomicReference<Throwable>();
+        Thread thread = new Thread(new Runnable() {
+            public void run() {
+                try (SSLSocket socket = (SSLSocket) server.accept()) {
+                    socket.setSoTimeout(10000);
+                    InputStream in = socket.getInputStream();
+                    int state = 0;
+                    while (state < 4) {
+                        int b = in.read();
+                        if (b < 0) throw new AssertionError("Unexpected EOF");
+                        int wanted = (state % 2 == 0) ? '\r' : '\n';
+                        state = b == wanted ? state + 1 : (b == '\r' ? 1 : 0);
+                    }
+                    OutputStream out = socket.getOutputStream();
+                    out.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK".getBytes("US-ASCII"));
+                    out.flush();
+                } catch (Throwable e) {
+                    failure.set(e);
+                }
+            }
+        });
+        thread.start();
+        HttpsURLConnection client = (HttpsURLConnection) new URL("https://localhost:" + server.getLocalPort() + "/").openConnection();
+        client.setConnectTimeout(10000);
+        client.setReadTimeout(10000);
+        if (args.length > 1 && args[1].equals("null-context")) {
+            SSLContext context = SSLContext.getInstance("TLS");
+            context.init(null, null, null);
+            client.setSSLSocketFactory(context.getSocketFactory());
+        }
+        try (InputStream in = client.getInputStream()) {
+            if (in.read() != 'O' || in.read() != 'K') throw new AssertionError("Response mismatch");
+        }
+        thread.join();
+        server.close();
+        if (failure.get() != null) throw new AssertionError(failure.get());
+        System.out.println("server verification checks=" + ProbeProvider.checks);
+        int expected = Integer.parseInt(System.getProperty("probe.expected", "1"));
+        if (ProbeProvider.checks != expected) throw new AssertionError("Expected " + expected + " checks");
+    }
+}
