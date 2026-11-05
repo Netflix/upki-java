@@ -4,6 +4,8 @@
 
 `upki-java` adds offline server-certificate revocation checking to Java TLS clients. It uses the local revocation cache maintained by [UPKI](https://github.com/rustls/upki), without making CRL or OCSP requests of its own. Once installed, PKIX JSSE clients use it without changing their TLS configuration.
 
+It uses the conventions proposed for the [Go programming language](https://github.com/golang/go/issues/82402) to provide a consistent experience between runtimes.
+
 > [!IMPORTANT]
 > This library is in preview and has no published release yet. API names, configuration properties, and defaults may change. Please report bugs and feature requests in this repository's [issue tracker](https://github.com/Netflix/upki-java/issues).
 >
